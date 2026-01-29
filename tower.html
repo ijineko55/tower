@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>超簡単タワーディフェンス（1レーン）</title>
+  <style>
+    body { margin:0; background:#111; color:#eee; font-family:system-ui, -apple-system, "Segoe UI", sans-serif; }
+    #ui { padding:10px 12px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+    #ui .pill { padding:6px 10px; border:1px solid rgba(255,255,255,.18); border-radius:999px; background:rgba(255,255,255,.06); }
+    #msg { opacity:.85; }
+    canvas { display:block; margin:0 auto; background:#151515; border-top:1px solid rgba(255,255,255,.08); }
+    button { padding:8px 12px; border-radius:12px; border:1px solid rgba(255,255,255,.18); background:rgba(255,255,255,.06); color:#eee; cursor:pointer; }
+    button:active { transform:scale(.99); }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div class="pill">💰Gold: <span id="gold">30</span></div>
+    <div class="pill">❤️Lives: <span id="lives">10</span></div>
+    <div class="pill">🏁Wave: <span id="wave">1</span></div>
+    <div class="pill">⭐Score: <span id="score">0</span></div>
+    <button id="toggle">⏸ Pause</button>
+    <button id="reset">🔄 Reset</button>
+    <div id="msg">Canvasをクリックでタワー設置（コスト: 10）</div>
+  </div>
+
+  <canvas id="cv" width="900" height="360"></canvas>
+
+  <script>
+    // ====== ここをいじると難易度調整できる ======
+    const TOWER_COST = 10;
+    const TOWER_RANGE = 220;
+    const TOWER_FIRE_RATE = 2.2; // 発/秒
+    const BULLET_SPEED = 420;
+    const BULLET_DAMAGE = 12;
+
+    const ENEMY_BASE_HP = 40;
+    const ENEMY_BASE_SPEED = 55; // px/秒
+    const ENEMY_SPAWN_INTERVAL = 1.0; // 秒
+    const ENEMIES_PER_WAVE = 15;
+    // =========================================
+
+    const canvas = document.getElementById("cv");
+    const ctx = canvas.getContext("2d");
+
+    const elGold = document.getElementById("gold");
+    const elLives = document.getElementById("lives");
+    const elWave = document.getElementById("wave");
+    const elScore = document.getElementById("score");
+    const elMsg = document.getElementById("msg");
+    const btnToggle = document.getElementById("toggle");
+    const btnReset = document.getElementById("reset");
+
+    // 高DPI対応（見た目くっきり）
+    function setupDPR() {
+      const dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+      const cssW = canvas.clientWidth || canvas.width;
+      const cssH = canvas.clientHeight || canvas.height;
+      canvas.style.width = cssW + "px";
+      canvas.style.height = cssH + "px";
+      canvas.width = Math.floor(cssW * dpr);
+      canvas.height = Math.floor(cssH * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    // 初回だけ（このサンプルは固定サイズなので簡略化）
+    // setupDPR(); // 使いたい場合は canvas のCSSサイズと合わせて調整
+
+    // 1レーンのY座標
+    const laneY = 190;
+
+    // グリッド（タワー設置用：スナップ）
+    const grid = 30;
+
+    let gold, lives, wave, score;
+    let paused = false;
+
+    /** @type {{x:number,y:number,range:number,cd:number,fireRate:number}[]} */
+    let towers = [];
+    /** @type {{x:number,y:number,hp:number,maxHp:number,speed:number}[]} */
+    let enemies = [];
+    /** @type {{x:number,y:number,vx:number,vy:number,damage:number,life:number}[]} */
+    let bullets = [];
+
+    let spawnTimer = 0;
+    let spawnedThisWave = 0;
+
+    function resetGame() {
+      gold = 30;
+      lives = 10;
+      wave = 1;
+      score = 0;
+      paused = false;
+
+      towers = [];
+      enemies = [];
+      bullets = [];
+
+      spawnTimer = 0;
+      spawnedThisWave = 0;
+
+      elMsg.textContent = `Canvasをクリックでタワー設置（コスト: ${TOWER_COST}）`;
+      btnToggle.textContent = "⏸ Pause";
+      syncUI();
+    }
+
+    function syncUI() {
+      elGold.textContent = String(gold);
+      elLives.textContent = String(lives);
+      elWave.textContent = String(wave);
+      elScore.textContent = String(score);
+    }
+
+    function snap(v) {
+      return Math.round(v / grid) * grid;
+    }
+
+    function canPlaceTower(x, y) {
+      // 画面外と、レーン線すぐ近くは置けない（好み）
+      if (x < 40 || x > 860 || y < 40 || y > 320) return false;
+      if (Math.abs(y - laneY) < 18) return false;
+
+      // 既存タワーと重なり禁止
+      for (const t of towers) {
+        const dx = t.x - x, dy = t.y - y;
+        if (Math.hypot(dx, dy) < 22) return false;
+      }
+      return true;
+    }
+
+    function spawnEnemy() {
+      // waveが上がるほどちょっと強くする
+      const hp = ENEMY_BASE_HP + (wave - 1) * 10;
+      const speed = ENEMY_BASE_SPEED + (wave - 1) * 6;
+
+      enemies.push({
+        x: 10,
+        y: laneY,
+        hp,
+        maxHp: hp,
+        speed
+      });
+    }
+
+    function startNextWaveIfNeeded() {
+      // 今waveで必要数出し切って、敵がいなくなったら次wave
+      if (spawnedThisWave >= ENEMIES_PER_WAVE && enemies.length === 0) {
+        wave += 1;
+        spawnedThisWave = 0;
+        spawnTimer = 0;
+        elMsg.textContent = `Wave ${wave} 開始！`;
+        syncUI();
+      }
+    }
+
+    function update(dt) {
+      if (paused) return;
+
+      // 敵スポーン
+      spawnTimer += dt;
+      if (spawnedThisWave < ENEMIES_PER_WAVE && spawnTimer >= ENEMY_SPAWN_INTERVAL) {
+        spawnTimer = 0;
+        spawnedThisWave += 1;
+        spawnEnemy();
+      }
+
+      // 敵移動
+      for (let i = enemies.length - 1; i >= 0; i--) {
+        const e = enemies[i];
+        e.x += e.speed * dt;
+
+        // ゴール到達（右端）
+        if (e.x > 890) {
+          enemies.splice(i, 1);
+          lives -= 1;
+          elMsg.textContent = "敵に抜けられた…";
+          if (lives <= 0) {
+            lives = 0;
+            paused = true;
+            btnToggle.textContent = "▶ Resume";
+            elMsg.textContent = "ゲームオーバー（Resetで再開）";
+          }
+        }
+      }
+
+      // タワーの射撃（最も近い敵を狙う）
+      for (const t of towers) {
+        t.cd -= dt;
+        if (t.cd > 0) continue;
+
+        // 射程内の敵を探す（最短距離）
+        let best = null;
+        let bestD = Infinity;
+        for (const e of enemies) {
+          const d = Math.hypot(e.x - t.x, e.y - t.y);
+          if (d <= t.range && d < bestD) {
+            bestD = d;
+            best = e;
+          }
+        }
+        if (best) {
+          // 発射
+          const dx = best.x - t.x;
+          const dy = best.y - t.y;
+          const len = Math.hypot(dx, dy) || 1;
+          bullets.push({
+            x: t.x,
+            y: t.y,
+            vx: (dx / len) * BULLET_SPEED,
+            vy: (dy / len) * BULLET_SPEED,
+            damage: BULLET_DAMAGE,
+            life: 1.5 // 秒で消える
+          });
+          t.cd = 1 / t.fireRate;
+        }
+      }
+
+      // 弾更新 & 当たり判定
+      for (let i = bullets.length - 1; i >= 0; i--) {
+        const b = bullets[i];
+        b.x += b.vx * dt;
+        b.y += b.vy * dt;
+        b.life -= dt;
+
+        let hitIndex = -1;
+        for (let j = 0; j < enemies.length; j++) {
+          const e = enemies[j];
+          // 円(弾) vs 矩形(敵)を雑に距離で判定（超簡単）
+          if (Math.hypot(e.x - b.x, e.y - b.y) < 14) {
+            hitIndex = j;
+            break;
+          }
+        }
+
+        if (hitIndex >= 0) {
+          const e = enemies[hitIndex];
+          e.hp -= b.damage;
+          bullets.splice(i, 1);
+
+          if (e.hp <= 0) {
+            enemies.splice(hitIndex, 1);
+            score += 1;
+            gold += 2; // 倒したら少しお金
+            elMsg.textContent = "撃破！";
+          }
+        } else if (b.life <= 0 || b.x < -20 || b.x > 920 || b.y < -20 || b.y > 380) {
+          bullets.splice(i, 1);
+        }
+      }
+
+      startNextWaveIfNeeded();
+      syncUI();
+    }
+
+    function draw() {
+      // 背景
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // レーン
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = "#1b1b1b";
+      ctx.fillRect(0, laneY - 16, 900, 32);
+
+      ctx.strokeStyle = "rgba(255,255,255,0.12)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(0, laneY);
+      ctx.lineTo(900, laneY);
+      ctx.stroke();
+
+      // ゴールライン
+      ctx.strokeStyle = "rgba(255,255,255,0.25)";
+      ctx.beginPath();
+      ctx.moveTo(890, 40);
+      ctx.lineTo(890, 320);
+      ctx.stroke();
+
+      // タワー
+      for (const t of towers) {
+        ctx.fillStyle = "#3aa0ff";
+        ctx.fillRect(t.x - 10, t.y - 10, 20, 20);
+
+        // 射程（薄く）
+        ctx.globalAlpha = 0.08;
+        ctx.beginPath();
+        ctx.arc(t.x, t.y, t.range, 0, Math.PI * 2);
+        ctx.fillStyle = "#3aa0ff";
+        ctx.fill();
+        ctx.globalAlpha = 0.9;
+      }
+
+      // 敵
+      for (const e of enemies) {
+        ctx.fillStyle = "#ff4a4a";
+        ctx.fillRect(e.x - 12, e.y - 12, 24, 24);
+
+        // HPバー
+        const w = 28;
+        const ratio = Math.max(0, e.hp / e.maxHp);
+        ctx.fillStyle = "rgba(255,255,255,0.16)";
+        ctx.fillRect(e.x - w/2, e.y - 22, w, 4);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(e.x - w/2, e.y - 22, w * ratio, 4);
+      }
+
+      // 弾
+      for (const b of bullets) {
+        ctx.fillStyle = "#fff";
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // テキスト（状態）
+      ctx.fillStyle = "rgba(255,255,255,0.7)";
+      ctx.font = "12px system-ui, -apple-system, Segoe UI, sans-serif";
+      ctx.fillText(paused ? "PAUSED" : "", 10, 20);
+    }
+
+    // メインループ
+    let last = performance.now();
+    function loop(now) {
+      const dt = Math.min(0.033, (now - last) / 1000); // 最大33msで安定化
+      last = now;
+
+      update(dt);
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    // クリックでタワー設置
+    canvas.addEventListener("click", (ev) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+
+      if (paused && lives <= 0) return; // ゲームオーバー中は置けない
+
+      const sx = snap(x);
+      const sy = snap(y);
+
+      if (gold < TOWER_COST) {
+        elMsg.textContent = "お金が足りない！";
+        return;
+      }
+      if (!canPlaceTower(sx, sy)) {
+        elMsg.textContent = "そこには置けない！";
+        return;
+      }
+
+      towers.push({
+        x: sx,
+        y: sy,
+        range: TOWER_RANGE,
+        fireRate: TOWER_FIRE_RATE,
+        cd: 0
+      });
+      gold -= TOWER_COST;
+      elMsg.textContent = "タワー設置！";
+      syncUI();
+    });
+
+    btnToggle.addEventListener("click", () => {
+      paused = !paused;
+      btnToggle.textContent = paused ? "▶ Resume" : "⏸ Pause";
+      elMsg.textContent = paused ? "一時停止" : "再開";
+    });
+
+    btnReset.addEventListener("click", resetGame);
+
+    resetGame();
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
